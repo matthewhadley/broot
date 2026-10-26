@@ -1,0 +1,104 @@
+name: Fork release
+
+# Builds this fork's binaries when a fork-* tag is pushed, and attaches them
+# to a GitHub release for that tag.
+#
+# Tags are named fork-<Cargo.toml version>-<7-character commit>, as in
+# fork-1.61.0-1a2b3c4, so they can't be mistaken for upstream's v* tags. The
+# check job refuses any other name.
+#
+# Each target gets a bare binary named broot-<target> and its checksum,
+# broot-<target>.sha256, in `shasum -a 256` format:
+#   https://github.com/<owner>/broot/releases/download/<tag>/broot-<target>
+#   https://github.com/<owner>/broot/releases/download/<tag>/broot-<target>.sha256
+
+on:
+  push:
+    tags: [ "fork-*" ]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+    - uses: actions/checkout@v5
+    - name: Check the tag name
+      id: tag
+      run: |
+        commit=$(git rev-parse HEAD)
+        echo "commit=$commit" >> "$GITHUB_OUTPUT"
+        version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+        expected="fork-$version-${commit:0:7}"
+        if [[ "$GITHUB_REF_NAME" != "$expected" ]]; then
+          echo "::error::tag $GITHUB_REF_NAME should be $expected"
+          exit 1
+        fi
+
+  build:
+    needs: check
+    strategy:
+      matrix:
+        include:
+        # Features as in upstream's release builds (build-scripts/_targets.sh):
+        # clipboard needs X11 on Linux, so the static build goes without.
+        - target: aarch64-apple-darwin
+          os: macos-latest
+          features: clipboard,sixel
+        - target: x86_64-unknown-linux-musl
+          os: ubuntu-latest
+          features: sixel
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install Rust
+      run: |
+        rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+        rustup default stable
+    - name: Build
+      run: cargo build --release --locked --target ${{ matrix.target }} --features ${{ matrix.features }}
+    - name: Package
+      run: |
+        mkdir dist
+        cp target/${{ matrix.target }}/release/broot dist/broot-${{ matrix.target }}
+        cd dist
+        shasum -a 256 broot-${{ matrix.target }} > broot-${{ matrix.target }}.sha256
+        cat broot-${{ matrix.target }}.sha256
+    - name: Smoke test
+      run: |
+        file dist/broot-${{ matrix.target }}
+        dist/broot-${{ matrix.target }} --version
+    - uses: actions/upload-artifact@v4
+      with:
+        name: broot-${{ matrix.target }}
+        path: dist/*
+        if-no-files-found: error
+
+  release:
+    needs: [ check, build ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        path: dist
+        merge-multiple: true
+    - name: Create the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        COMMIT: ${{ needs.check.outputs.commit }}
+      run: |
+        cd dist
+        shasum -a 256 -c *.sha256
+        gh release create "$GITHUB_REF_NAME" * \
+          --repo "$GITHUB_REPOSITORY" \
+          --verify-tag \
+          --title "$GITHUB_REF_NAME (fork build)" \
+          --notes "Unofficial build of $GITHUB_REPOSITORY at $COMMIT, not an upstream broot release. Upstream releases are at https://github.com/Canop/broot/releases."
